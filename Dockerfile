@@ -9,7 +9,7 @@ WORKDIR /go/src/github.com/sot-tech/mochi
 COPY . /go/src/github.com/sot-tech/mochi
 
 # Install our golang dependencies and compile our binary.
-RUN CGO_ENABLED=0 go install ./cmd/mochi
+RUN GOMAXPROCS=2 CGO_ENABLED=0 go install ./cmd/mochi
 
 FROM alpine:latest
 RUN apk add --no-cache ca-certificates

@@ -5,6 +5,7 @@ import (
 	"crypto/sha1"
 	"crypto/sha256"
 	"fmt"
+	"hash"
 	"io"
 	"path/filepath"
 	"strings"
@@ -108,6 +109,86 @@ type torrentNameInfoStruct struct {
 	Name string `bencode:"name"`
 }
 
+func (s *s3) scan(ctx context.Context, files map[string][2]bittorrent.InfoHash, tmpFiles map[string]bool, s1, s2 hash.Hash, bucket, prefix string, s3Client *awss3.Client) {
+	logger.Debug().Msg("starting directory scan")
+	listObj := &awss3.ListObjectsV2Input{Bucket: &bucket, Prefix: &prefix}
+	if entries, err := s3Client.ListObjectsV2(ctx, listObj); err == nil {
+		for _, e := range entries.Contents {
+			if strings.ToLower(filepath.Ext(*e.Key)) == ".torrent" {
+				tmpFiles[filepath.Join(prefix, *e.Key)] = true
+			}
+		}
+		for p := range tmpFiles {
+			if _, exists := files[p]; !exists {
+				requestInput := &awss3.GetObjectInput{
+			        Bucket: aws.String(bucket),
+			        Key:    aws.String(p),
+			    }
+
+			    result, err := s3Client.GetObject(ctx, requestInput)
+			    if err != nil {
+			        log.Print(err)
+			    }
+				var info torrentRawInfoStruct
+				err = bencode.NewDecoder(io.LimitReader(result.Body, maxTorrentSize)).Decode(&info)
+				if err == nil {
+					s1.Write(info.Info)
+					h1, _ := bittorrent.NewInfoHash(s1.Sum(nil))
+					s1.Reset()
+
+					s2.Write(info.Info)
+					h2, _ := bittorrent.NewInfoHash(s2.Sum(nil))
+					s2.Reset()
+
+					files[p] = [2]bittorrent.InfoHash{h1, h2}
+					var name torrentNameInfoStruct
+					if err := bencode.DecodeBytes(info.Info, &name); err != nil {
+						logger.Warn().
+							Err(err).
+							Str("file", p).
+							Msg("unable to unmarshal torrent info")
+					}
+					if len(name.Name) == 0 {
+						name.Name = list.DUMMY
+					}
+					bName := str2bytes.StringToBytes(name.Name)
+					logger.Err(s.Storage.Put(ctx, s.StorageCtx, storage.Entry{
+						Key:   h1.RawString(),
+						Value: bName,
+					}, storage.Entry{
+						Key:   h2.RawString(),
+						Value: bName,
+					}, storage.Entry{
+						Key:   h2.TruncateV1().RawString(),
+						Value: bName,
+					})).
+						Str("file", p).
+						Stringer("infoHash", h1).
+						Stringer("infoHashV2", h2).
+						Msg("added torrent to approval list")
+				}
+			}
+			if err != nil {
+				logger.Warn().Err(err).Str("file", p).Msg("unable to read file")
+			}
+		}
+		for p, ih := range files {
+			if _, isOk := tmpFiles[p]; !isOk {
+				delete(files, p)
+				logger.Err(s.Storage.Delete(ctx, s.StorageCtx, ih[0].RawString(),
+					ih[1].RawString(), ih[1].TruncateV1().RawString())).
+					Str("file", p).
+					Stringer("infoHash", ih[1]).
+					Stringer("infoHashV2", ih[1]).
+					Msg("deleted torrent from approval list")
+			}
+		}
+		clear(tmpFiles)
+	} else {
+		logger.Warn().Err(err).Msg("unable to get directory content")
+	}
+}
+
 func (s *s3) runScan(ctx context.Context, bucket, prefix string, s3Client *awss3.Client,  period time.Duration) {
 	t := time.NewTicker(period)
 	defer t.Stop()
@@ -115,88 +196,15 @@ func (s *s3) runScan(ctx context.Context, bucket, prefix string, s3Client *awss3
 	tmpFiles := make(map[string]bool)
 	// nolint:gosec
 	s1, s2 := sha1.New(), sha256.New()
+	// Run initial scan.
+	s.scan(ctx, files, tmpFiles, s1, s2, bucket, prefix, s3Client)
+
 	for {
 		select {
 		case <-s.closed:
 			return
 		case <-t.C:
-			logger.Debug().Msg("starting directory scan")
-			listObj := &awss3.ListObjectsV2Input{Bucket: &bucket, Prefix: &prefix}
-			if entries, err := s3Client.ListObjectsV2(ctx, listObj); err == nil {
-				for _, e := range entries.Contents {
-					if strings.ToLower(filepath.Ext(*e.Key)) == ".torrent" {
-						tmpFiles[filepath.Join(prefix, *e.Key)] = true
-					}
-				}
-				for p := range tmpFiles {
-					if _, exists := files[p]; !exists {
-						requestInput := &awss3.GetObjectInput{
-					        Bucket: aws.String(bucket),
-					        Key:    aws.String(p),
-					    }
-
-					    result, err := s3Client.GetObject(ctx, requestInput)
-					    if err != nil {
-					        log.Print(err)
-					    }
-						var info torrentRawInfoStruct
-						err = bencode.NewDecoder(io.LimitReader(result.Body, maxTorrentSize)).Decode(&info)
-						if err == nil {
-							s1.Write(info.Info)
-							h1, _ := bittorrent.NewInfoHash(s1.Sum(nil))
-							s1.Reset()
-
-							s2.Write(info.Info)
-							h2, _ := bittorrent.NewInfoHash(s2.Sum(nil))
-							s2.Reset()
-
-							files[p] = [2]bittorrent.InfoHash{h1, h2}
-							var name torrentNameInfoStruct
-							if err := bencode.DecodeBytes(info.Info, &name); err != nil {
-								logger.Warn().
-									Err(err).
-									Str("file", p).
-									Msg("unable to unmarshal torrent info")
-							}
-							if len(name.Name) == 0 {
-								name.Name = list.DUMMY
-							}
-							bName := str2bytes.StringToBytes(name.Name)
-							logger.Err(s.Storage.Put(ctx, s.StorageCtx, storage.Entry{
-								Key:   h1.RawString(),
-								Value: bName,
-							}, storage.Entry{
-								Key:   h2.RawString(),
-								Value: bName,
-							}, storage.Entry{
-								Key:   h2.TruncateV1().RawString(),
-								Value: bName,
-							})).
-								Str("file", p).
-								Stringer("infoHash", h1).
-								Stringer("infoHashV2", h2).
-								Msg("added torrent to approval list")
-						}
-					}
-					if err != nil {
-						logger.Warn().Err(err).Str("file", p).Msg("unable to read file")
-					}
-				}
-				for p, ih := range files {
-					if _, isOk := tmpFiles[p]; !isOk {
-						delete(files, p)
-						logger.Err(s.Storage.Delete(ctx, s.StorageCtx, ih[0].RawString(),
-							ih[1].RawString(), ih[1].TruncateV1().RawString())).
-							Str("file", p).
-							Stringer("infoHash", ih[1]).
-							Stringer("infoHashV2", ih[1]).
-							Msg("deleted torrent from approval list")
-					}
-				}
-				clear(tmpFiles)
-			} else {
-				logger.Warn().Err(err).Msg("unable to get directory content")
-			}
+			s.scan(ctx, files, tmpFiles, s1, s2, bucket, prefix, s3Client)
 		}
 	}
 }
